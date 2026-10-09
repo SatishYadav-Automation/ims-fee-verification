@@ -1,0 +1,184 @@
+image: markhobson/maven-chrome:jdk-21
+
+definitions:
+  caches:
+    maven: ~/.m2/repository
+
+  steps:
+
+    - &generate-allure
+      step:
+        name: Generate Allure Report
+        image: frankescobar/allure-docker-service:2.27.0
+        script:
+          - allure generate --clean target/allure-results -o target/allure-report || true
+        artifacts:
+          - target/allure-report/**
+
+    - &upload-report
+      step:
+        name: Upload Allure Report to GCP
+        image: google/cloud-sdk:latest
+        script:
+          - echo "$GCP_KEY_JSON" > /tmp/key.json
+          - gcloud auth activate-service-account --key-file=/tmp/key.json
+          - gcloud config set project "$GCP_PROJECT_ID"
+          - gsutil -m cp -r target/allure-report/* gs://$GCP_BUCKET_NAME/build-$BITBUCKET_BUILD_NUMBER/
+
+    - &parse-failures
+      step:
+        name: Parse Failed Tests
+        image: python:3.9-slim
+        script:
+          - |
+            python3 - <<EOF > failed_tests_rows.html
+            import glob
+            import xml.etree.ElementTree as ET
+
+            FAIL_ROWS = ""
+
+            for filename in glob.glob("target/surefire-reports/*.xml"):
+                try:
+                    tree = ET.parse(filename)
+                    root = tree.getroot()
+                except ET.ParseError:
+                    continue
+
+                for testcase in root.findall('testcase'):
+                    failure = testcase.find('failure')
+                    if failure is not None:
+                        full_class = testcase.get('classname', 'N/A')
+                        method_name = testcase.get('name', 'N/A')
+                        reason = failure.get('message', 'No message provided')
+                        simple_class = full_class.split('.')[-1]
+                        FAIL_ROWS += f'<tr><td>{simple_class}</td><td>{method_name}</td><td>{reason}</td></tr>'
+
+            print(FAIL_ROWS if FAIL_ROWS else "<tr><td colspan='3'>No failures.</td></tr>")
+            EOF
+        artifacts:
+          - failed_tests_rows.html
+
+    - &create-email
+      step:
+        name: Create Email Body
+        script:
+          - if [ -f build_vars.sh ]; then source build_vars.sh; fi
+          - |
+            python3 - <<'EOF' > email_body.html
+            import json, xml.etree.ElementTree as ET, os, glob
+            total = passed = failed = skipped = 0
+            
+            # Read from Allure result.json files (only test results, not containers)
+            for f in glob.glob("target/allure-results/*-result.json"):
+                try:
+                    with open(f) as file:
+                        data = json.load(file)
+                        total += 1
+                        status = data.get('status', 'unknown')
+                        if status == 'passed':
+                            passed += 1
+                        elif status == 'failed' or status == 'broken':
+                            failed += 1
+                        elif status == 'skipped':
+                            skipped += 1
+                except:
+                    pass
+            
+            fail_rows = open("failed_tests_rows.html").read() if os.path.exists("failed_tests_rows.html") else "<tr><td colspan='3'>No failures.</td></tr>"
+            report_url = f"https://storage.googleapis.com/{os.environ['GCP_BUCKET_NAME']}/build-{os.environ['BITBUCKET_BUILD_NUMBER']}/index.html"
+            suite_name = os.environ.get('SUITE_DISPLAY_NAME', 'All Suites')
+            print(f"""<html><body style='font-family:Arial;'>
+              <h2>IMS Fee Verification — Test Summary ({suite_name})</h2>
+              <p>Total Tests: <strong style='color:#2E86C1;'>{total}</strong></p>
+              <p>Passed: <strong style='color:#155724;'>{passed}</strong></p>
+              <p>Failed: <strong style='color:#721c24;'>{failed}</strong></p>
+              <p>Skipped: <strong style='color:#856404;'>{skipped}</strong></p>
+              <p><a href='{report_url}'>Click here to view full Allure Report</a></p>
+              <h3>🔴 Failed Tests Details</h3>
+              <table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse; width:100%;'>
+                <tr style='background:#f8d7da; font-weight:bold;'>
+                  <th>Class Name</th><th>Method Name</th><th>Reason</th>
+                </tr>
+                {fail_rows}
+              </table>
+              </body></html>""")
+            EOF
+        artifacts:
+          - email_body.html
+
+    - &send-email
+      step:
+        name: Send Email
+        script:
+          - if [ -f build_vars.sh ]; then source build_vars.sh; fi
+          - pipe: atlassian/email-notify:0.5.0
+            variables:
+              HOST: 'smtp.gmail.com'
+              PORT: '587'
+              USERNAME: $SMTP_USERNAME
+              PASSWORD: $SMTP_PASSWORD
+              FROM: $SMTP_USERNAME
+              TO: $EMAIL_TO
+              SUBJECT: "Automation Test Results | IMS Fee Verification | ${SUITE_DISPLAY_NAME} | Build #$BITBUCKET_BUILD_NUMBER"
+              BODY_HTML: "email_body.html"
+
+pipelines:
+
+  default:
+    - step:
+        name: Run Tests — All (UI + API)
+        caches:
+          - maven
+        script:
+          - export SUITE_DISPLAY_NAME="All Tests (UI + API)"
+          - echo "export SUITE_DISPLAY_NAME='$SUITE_DISPLAY_NAME'" > build_vars.sh
+          - mvn clean test -Dmaven.test.failure.ignore=true -Dsurefire.suiteXmlFiles=testng/testng.xml
+        artifacts:
+          - target/surefire-reports/**
+          - target/allure-results/**
+          - build_vars.sh
+    - <<: *generate-allure
+    - <<: *upload-report
+    - <<: *parse-failures
+    - <<: *create-email
+    - <<: *send-email
+
+  custom:
+
+    run-api-tests:
+      - step:
+          name: Run Tests — API
+          caches:
+            - maven
+          script:
+            - export SUITE_DISPLAY_NAME="API Tests"
+            - echo "export SUITE_DISPLAY_NAME='$SUITE_DISPLAY_NAME'" > build_vars.sh
+            - mvn clean test -Denv=staging -Dmaven.test.failure.ignore=true -Dsurefire.suiteXmlFiles=testng/ApiTests.xml
+          artifacts:
+            - target/surefire-reports/**
+            - target/allure-results/**
+            - build_vars.sh
+      - <<: *generate-allure
+      - <<: *upload-report
+      - <<: *parse-failures
+      - <<: *create-email
+      - <<: *send-email
+
+    run-ui-tests:
+      - step:
+          name: Run Tests — UI
+          caches:
+            - maven
+          script:
+            - export SUITE_DISPLAY_NAME="UI Tests"
+            - echo "export SUITE_DISPLAY_NAME='$SUITE_DISPLAY_NAME'" > build_vars.sh
+            - mvn clean test -Denv=staging -Dmaven.test.failure.ignore=true -Dsurefire.suiteXmlFiles=testng/UiTests.xml
+          artifacts:
+            - target/surefire-reports/**
+            - target/allure-results/**
+            - build_vars.sh
+      - <<: *generate-allure
+      - <<: *upload-report
+      - <<: *parse-failures
+      - <<: *create-email
+      - <<: *send-email
